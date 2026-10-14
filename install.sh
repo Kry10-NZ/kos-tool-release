@@ -3,14 +3,25 @@
 #
 # SPDX-License-Identifier: LicenseRef-Kry10
 
-# Installs kos-tool from GitHub Releases.
+# Installs kos-tool from GitHub Releases. Creates /opt/kry10, where kos-tool installs the KOS SDK.
 #
-#   curl -fsSL https://<host> | sh
-#   curl -fsSL https://<host> | sh -s -- --version 0.2.0 --to "$HOME/.local/bin"
+# Use of root in this script:
+#   - Runs as the user, not under sudo. Uses sudo only to create /opt/kry10.
+#   - Shows the sudo commands and asks before it runs them.
+#   - Asks on the terminal, because stdin is the script. Stops when there is not a terminal.
+#   - Sets the user as the owner of the new /opt/kry10, so kos-tool does not need sudo.
+#   - Does not change an /opt/kry10 that exists. Another user can own it.
+#
+# Examples, where <url> is the address of this script:
+#   curl -fsSL <url> | sh                                  Install the latest release to /opt/kry10/bin.
+#   curl -fsSL <url> | sh -s -- --version 0.2.0            Install release 0.2.0.
+#   curl -fsSL <url> | sh -s -- --to "$HOME/.local/bin"    Install to a different directory.
+#   curl -fsSL <url> | sh -s -- --yes                      Run sudo without the question, for example in CI.
 #
 # Options (each also read from the environment):
 #   --version <version>  KOS_TOOL_VERSION  A release such as 0.2.0, or "latest" (the default).
 #   --to <dir>           KOS_TOOL_DIR      Where kos-tool goes, /opt/kry10/bin by default.
+#   --yes                KOS_TOOL_YES=1    Create /opt/kry10 with sudo without asking first.
 #
 # KOS_TOOL_RELEASES_URL points the script at a mirror laid out like GitHub Releases.
 
@@ -27,9 +38,10 @@ err() {
 }
 
 usage() {
-    say "usage: install.sh [--version <version>] [--to <dir>]"
+    say "usage: install.sh [--version <version>] [--to <dir>] [--yes]"
     say "  --version  a kos-tool release such as 0.2.0, or latest (default; also KOS_TOOL_VERSION)"
     say "  --to       the directory to install into (default /opt/kry10/bin; also KOS_TOOL_DIR)"
+    say "  --yes      create $KRY10_DIR with sudo without asking first (also KOS_TOOL_YES=1)"
 }
 
 has() { command -v "$1" > /dev/null 2>&1; }
@@ -37,7 +49,7 @@ has() { command -v "$1" > /dev/null 2>&1; }
 # Fails up front with every missing tool named, rather than partway through the install.
 check_tools() {
     missing=
-    for tool in curl uname mktemp chmod mkdir mv cut head tail sort; do
+    for tool in curl uname id mktemp chmod mkdir mv cut head tail sort; do
         has "$tool" || missing="$missing $tool"
     done
     if has sha256sum; then
@@ -107,10 +119,46 @@ installed_version() {
     echo "${v%-*}"
 }
 
+# Not `:`, a special built-in: dash exits the script when a special built-in's redirection fails.
+can_ask() { true 2> /dev/null < /dev/tty; }
+
+# On failure, kry10_fix tells the user what to do.
+create_kry10_dir() {
+    kry10_fix="Run this script again to create it."
+    if [ "$(id -u)" = 0 ]; then
+        mkdir -p "$KRY10_DIR"
+        return
+    fi
+    say "kos-tool installs the KOS SDK to $KRY10_DIR, which does not exist. To create it, this script runs:"
+    say ""
+    say "  sudo mkdir -p $KRY10_DIR"
+    say "  sudo chown $(id -u) $KRY10_DIR"
+    say ""
+    if ! has sudo; then
+        kry10_fix="sudo is not installed. As root, run: mkdir -p $KRY10_DIR && chown $(id -u) $KRY10_DIR"
+        return 1
+    fi
+    if [ "$yes" = false ]; then
+        if ! can_ask; then
+            kry10_fix="This script cannot ask for permission without a terminal. Run it again in a terminal, or with --yes."
+            return 1
+        fi
+        printf 'Continue? [Y/n] ' > /dev/tty
+        read -r answer < /dev/tty || answer=n
+        case $answer in
+            "" | [Yy]*) ;;
+            *) return 1 ;;
+        esac
+    fi
+    sudo mkdir -p "$KRY10_DIR" && sudo chown "$(id -u)" "$KRY10_DIR"
+}
+
 # Everything runs from here, called on the last line, so a download cut short by curl | sh runs nothing.
 main() {
     version=${KOS_TOOL_VERSION:-latest}
     dir=${KOS_TOOL_DIR:-$KRY10_DIR/bin}
+    yes=false
+    [ "${KOS_TOOL_YES:-}" != 1 ] || yes=true
 
     while [ $# -gt 0 ]; do
         case $1 in
@@ -132,6 +180,10 @@ main() {
                 dir=${1#*=}
                 shift
                 ;;
+            -y | --yes)
+                yes=true
+                shift
+                ;;
             -h | --help)
                 usage
                 exit 0
@@ -148,13 +200,20 @@ main() {
     check_tools
     platform=$(detect_platform)
 
+    # Under sudo, root owns kos-tool and /opt/kry10. Then kos-tool, run as the user, cannot write the SDK.
+    [ "$(id -u)" != 0 ] || [ "${SUDO_USER:-root}" = root ] ||
+        err "run this script without sudo. It runs sudo itself when it needs to."
+
+    kry10_problem=
     if [ ! -d "$KRY10_DIR" ]; then
-        say "kos-tool installs the KOS SDK to $KRY10_DIR, which does not exist. Create it with:"
-        say ""
-        say "  sudo mkdir -p $KRY10_DIR && sudo chown \"\$(id -u)\" $KRY10_DIR"
-        say ""
+        create_kry10_dir || kry10_problem="$KRY10_DIR does not exist"
+    elif [ ! -w "$KRY10_DIR" ]; then
+        kry10_problem="$KRY10_DIR is not writable by $(id -un)"
+        kry10_fix="Ask its owner for write access."
+    fi
+    if [ -n "$kry10_problem" ]; then
         case $dir in
-            "$KRY10_DIR" | "$KRY10_DIR"/*) err "run that, then run this script again" ;;
+            "$KRY10_DIR" | "$KRY10_DIR"/*) err "$kry10_problem. $kry10_fix" ;;
         esac
     fi
 
@@ -205,6 +264,11 @@ main() {
         say "kos-tool $old → $version"
     else
         say "kos-tool $version installed to $bin"
+    fi
+
+    if [ -n "$kry10_problem" ]; then
+        say ""
+        say "$kry10_problem, so kos-tool cannot install the KOS SDK yet. $kry10_fix"
     fi
 
     case ":$PATH:" in
