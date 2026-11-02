@@ -4,13 +4,15 @@
 # SPDX-License-Identifier: LicenseRef-Kry10
 
 # Installs kos-tool from GitHub Releases. Creates /opt/kry10, where kos-tool installs the KOS SDK.
+# Links /usr/local/bin/kos-tool to /opt/kry10/bin/kos-tool, so kos-tool is on PATH in the terminal that ran the script.
 #
 # Use of root in this script:
-#   - Runs as the user, not under sudo. Uses sudo only to create /opt/kry10.
+#   - Runs as the user, not under sudo. Uses sudo only to create /opt/kry10 and the link in /usr/local/bin.
 #   - Shows the sudo commands and asks before it runs them.
 #   - Asks on the terminal, because stdin is the script. Stops when there is not a terminal.
 #   - Sets the user as the owner of the new /opt/kry10, so kos-tool does not need sudo.
 #   - Does not change an /opt/kry10 that exists. Another user can own it.
+#   - Does not change a /usr/local/bin/kos-tool that exists.
 #
 # Examples, where <url> is the address of this script:
 #   curl -fsSL <url> | sh                                  Install the latest release to /opt/kry10/bin.
@@ -20,8 +22,8 @@
 #
 # Options (each also read from the environment):
 #   --version <version>  KOS_TOOL_VERSION  A release such as 0.2.0, or "latest" (the default).
-#   --to <dir>           KOS_TOOL_DIR      Where kos-tool goes, /opt/kry10/bin by default.
-#   --yes                KOS_TOOL_YES=1    Create /opt/kry10 with sudo without asking first.
+#   --to <dir>           KOS_TOOL_DIR      Where kos-tool goes, /opt/kry10/bin by default. Not linked in /usr/local/bin.
+#   --yes                KOS_TOOL_YES=1    Run the sudo commands without asking first.
 #
 # KOS_TOOL_RELEASES_URL points the script at a mirror laid out like GitHub Releases.
 
@@ -30,6 +32,8 @@ set -eu
 RELEASES_URL=${KOS_TOOL_RELEASES_URL:-https://github.com/Kry10-NZ/kos-tool-release/releases}
 # nix compiles absolute paths into the packages kos-tool installs, so it needs this directory whatever --to says.
 KRY10_DIR=/opt/kry10
+# On the default PATH of macOS (from /etc/paths) and of the common Linux distributions.
+LINK_DIR=/usr/local/bin
 
 say() { printf '%s\n' "$*"; }
 err() {
@@ -41,7 +45,7 @@ usage() {
     say "usage: install.sh [--version <version>] [--to <dir>] [--yes]"
     say "  --version  a kos-tool release such as 0.2.0, or latest (default; also KOS_TOOL_VERSION)"
     say "  --to       the directory to install into (default /opt/kry10/bin; also KOS_TOOL_DIR)"
-    say "  --yes      create $KRY10_DIR with sudo without asking first (also KOS_TOOL_YES=1)"
+    say "  --yes      run the sudo commands without asking first (also KOS_TOOL_YES=1)"
 }
 
 has() { command -v "$1" > /dev/null 2>&1; }
@@ -122,25 +126,61 @@ installed_version() {
 # Not `:`, a special built-in: dash exits the script when a special built-in's redirection fails.
 can_ask() { true 2> /dev/null < /dev/tty; }
 
-# On failure, kry10_fix tells the user what to do.
-create_kry10_dir() {
-    kry10_fix="Run this script again to create it."
+# Prints "ok" when $LINK_DIR/kos-tool links to $1, "missing" when nothing is there, and "other" for anything else.
+# -ef also accepts a link made another way, for example a relative link. readlink accepts a link to a $1 that does not exist yet.
+link_state() {
+    if [ "$LINK_DIR/kos-tool" -ef "$1" ] || { [ -L "$LINK_DIR/kos-tool" ] && [ "$(readlink "$LINK_DIR/kos-tool")" = "$1" ]; }; then
+        echo ok
+    elif [ -e "$LINK_DIR/kos-tool" ] || [ -L "$LINK_DIR/kos-tool" ]; then
+        echo other
+    else
+        echo missing
+    fi
+}
+
+# Runs the commands that setup_as_root needs, each with $1 in front: "sudo", "show", or "" to run them directly.
+setup_commands() {
+    if [ "$make_dir" = true ]; then
+        $1 mkdir -p "$KRY10_DIR" || return 1
+        $1 chown "$(id -u)" "$KRY10_DIR" || return 1
+    fi
+    if [ "$make_link" = true ]; then
+        $1 mkdir -p "$LINK_DIR" || return 1
+        $1 ln -s "$KRY10_DIR/bin/kos-tool" "$LINK_DIR/kos-tool" || return 1
+    fi
+}
+
+show() { say "  sudo $*"; }
+
+# Creates $KRY10_DIR when $1 is true, and the link in $LINK_DIR when $2 is true, in one sudo step.
+# On failure, setup_fix tells the user what to do.
+setup_as_root() {
+    make_dir=$1
+    make_link=$2
+    setup_fix="Run this script again."
+    # For example root, or a Mac where Homebrew made the user the owner of /usr/local/bin.
+    if [ "$make_link" = true ] && [ -w "$LINK_DIR" ]; then
+        ln -s "$KRY10_DIR/bin/kos-tool" "$LINK_DIR/kos-tool"
+        make_link=false
+    fi
+    [ "$make_dir" = true ] || [ "$make_link" = true ] || return 0
     if [ "$(id -u)" = 0 ]; then
-        mkdir -p "$KRY10_DIR"
+        setup_commands ""
         return
     fi
-    say "kos-tool installs the KOS SDK to $KRY10_DIR, which does not exist. To create it, this script runs:"
+    [ "$make_dir" = false ] || say "kos-tool installs the KOS SDK to $KRY10_DIR, which does not exist."
+    [ "$make_link" = false ] || say "A link in $LINK_DIR puts kos-tool on your PATH."
+    say "To do this, this script runs:"
     say ""
-    say "  sudo mkdir -p $KRY10_DIR"
-    say "  sudo chown $(id -u) $KRY10_DIR"
+    setup_commands show
     say ""
     if ! has sudo; then
-        kry10_fix="sudo is not installed. As root, run: mkdir -p $KRY10_DIR && chown $(id -u) $KRY10_DIR"
+        setup_fix="sudo is not installed. Run this script again as root."
         return 1
     fi
     if [ "$yes" = false ]; then
         if ! can_ask; then
-            kry10_fix="This script cannot ask for permission without a terminal. Run it again in a terminal, or with --yes."
+            setup_fix="This script cannot ask for permission without a terminal. Run it again in a terminal, or with --yes."
             return 1
         fi
         printf 'Continue? [Y/n] ' > /dev/tty
@@ -150,7 +190,7 @@ create_kry10_dir() {
             *) return 1 ;;
         esac
     fi
-    sudo mkdir -p "$KRY10_DIR" && sudo chown "$(id -u)" "$KRY10_DIR"
+    setup_commands sudo
 }
 
 # Everything runs from here, called on the last line, so a download cut short by curl | sh runs nothing.
@@ -204,9 +244,19 @@ main() {
     [ "$(id -u)" != 0 ] || [ "${SUDO_USER:-root}" = root ] ||
         err "run this script without sudo. It runs sudo itself when it needs to."
 
+    make_dir=false
+    [ -d "$KRY10_DIR" ] || make_dir=true
+    make_link=false
+    if [ "$dir" = "$KRY10_DIR/bin" ] && [ "$(link_state "$KRY10_DIR/bin/kos-tool")" = missing ]; then
+        make_link=true
+    fi
+    # A link that is not made is not an error. The PATH check at the end tells the user what to do.
+    setup_as_root "$make_dir" "$make_link" || true
+
     kry10_problem=
     if [ ! -d "$KRY10_DIR" ]; then
-        create_kry10_dir || kry10_problem="$KRY10_DIR does not exist"
+        kry10_problem="$KRY10_DIR does not exist"
+        kry10_fix=$setup_fix
     elif [ ! -w "$KRY10_DIR" ]; then
         kry10_problem="$KRY10_DIR is not writable by $(id -un)"
         kry10_fix="Ask its owner for write access."
@@ -271,15 +321,23 @@ main() {
         say "$kry10_problem, so kos-tool cannot install the KOS SDK yet. $kry10_fix"
     fi
 
-    case ":$PATH:" in
-        *":$dir:"*) ;;
-        *)
-            say ""
-            say "$dir is not on your PATH. Add it with:"
-            say ""
-            say "  export PATH=\"$dir:\$PATH\""
-            ;;
-    esac
+    on_path=false
+    case ":$PATH:" in *":$dir:"*) on_path=true ;; esac
+    if [ "$(link_state "$bin")" = ok ]; then
+        case ":$PATH:" in *":$LINK_DIR:"*) on_path=true ;; esac
+    elif [ "$dir" = "$KRY10_DIR/bin" ] && [ "$(link_state "$bin")" = other ]; then
+        say ""
+        say "$LINK_DIR/kos-tool exists and is not a link to $bin, so this script did not change it."
+    elif [ "$dir" = "$KRY10_DIR/bin" ]; then
+        say ""
+        say "This script did not make the link in $LINK_DIR. $setup_fix"
+    fi
+    if [ "$on_path" = false ]; then
+        say ""
+        say "$dir is not on your PATH. Add it with:"
+        say ""
+        say "  export PATH=\"$dir:\$PATH\""
+    fi
 }
 
 main "$@"
