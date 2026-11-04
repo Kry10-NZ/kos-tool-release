@@ -116,11 +116,16 @@ resolve_latest() {
 }
 
 # kos-tool --version prints "kos-tool v<semver>-<build>" on its first line.
+# <build> is a short commit hash, which this removes. Older builds, like "kos-tool v0.1.1-beta-26.Oct-00", end with something else, and print as they are.
 installed_version() {
     line=$("$1" --version 2> /dev/null | head -n 1) || return 0
     v=${line#kos-tool v}
     [ "$v" != "$line" ] || return 0
-    echo "${v%-*}"
+    build=${v##*-}
+    case $build in
+        "$v" | *[!0-9a-f]*) echo "$v" ;;
+        *) if [ ${#build} -ge 7 ]; then echo "${v%-*}"; else echo "$v"; fi ;;
+    esac
 }
 
 # Not `:`, a special built-in: dash exits the script when a special built-in's redirection fails.
